@@ -1,0 +1,37 @@
+# Build outputs
+build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.ninja
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dylib
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+.env/
+
+# Torch extensions cache
+*.o
+*.a
+*.lib
+*.dll
+*.pdb
+**/torch_extensions/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

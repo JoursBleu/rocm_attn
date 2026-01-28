@@ -1,0 +1,43 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <hip/hip_runtime.h>
+
+#include "attn_kernel.h"
+
+static torch::Tensor attn_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA/HIP tensor");
+    TORCH_CHECK(k.is_cuda(), "k must be a CUDA/HIP tensor");
+    TORCH_CHECK(v.is_cuda(), "v must be a CUDA/HIP tensor");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
+    TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
+    TORCH_CHECK(v.scalar_type() == torch::kFloat32, "v must be float32");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D [B, H, S, D]");
+
+    auto q_contig = q.contiguous();
+    auto k_contig = k.contiguous();
+    auto v_contig = v.contiguous();
+
+    const int B = static_cast<int>(q_contig.size(0));
+    const int H = static_cast<int>(q_contig.size(1));
+    const int S = static_cast<int>(q_contig.size(2));
+    const int D = static_cast<int>(q_contig.size(3));
+
+    auto out = torch::zeros_like(q_contig);
+
+    hipStream_t stream = reinterpret_cast<hipStream_t>(at::cuda::getDefaultCUDAStream().stream());
+
+    launch_attn_forward(
+        q_contig.data_ptr<float>(),
+        k_contig.data_ptr<float>(),
+        v_contig.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B, H, S, D,
+        stream
+    );
+
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("attn_forward", &attn_forward, "Naive attention forward (ROCm)");
+}
