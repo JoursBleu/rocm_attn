@@ -69,7 +69,7 @@ int main() {
     hipMemcpy(d_k, h_k.data(), total * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_v, h_v.data(), total * sizeof(float), hipMemcpyHostToDevice);
 
-    launch_attn_forward(d_q, d_k, d_v, d_out, B, H, S, D, nullptr);
+    launch_attn_forward(d_q, d_k, d_v, d_out, B, H, S, S, D, false, ATTN_F32, nullptr);
     hipDeviceSynchronize();
 
     hipMemcpy(h_out.data(), d_out, total * sizeof(float), hipMemcpyDeviceToHost);

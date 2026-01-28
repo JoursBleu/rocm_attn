@@ -56,8 +56,31 @@ def bench_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, iters: int, w
     return (time.time() - t0) / iters
 
 
+def bench_rocm_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, iters: int, warmup: int) -> Optional[float]:
+    try:
+        from rocm_attn_op import attn_forward
+    except Exception:
+        return None
+
+    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+        q = q.float().contiguous()
+        k = k.float().contiguous()
+        v = v.float().contiguous()
+
+    _ = attn_forward(q, k, v)
+    _sync(q.device)
+    for _ in range(warmup):
+        _ = attn_forward(q, k, v)
+    _sync(q.device)
+    t0 = time.time()
+    for _ in range(iters):
+        _ = attn_forward(q, k, v)
+    _sync(q.device)
+    return (time.time() - t0) / iters
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark SDPA vs FlashAttention")
+    parser = argparse.ArgumentParser(description="Benchmark ROCm attn vs SDPA vs FlashAttention")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seqlen", type=int, default=256)
     parser.add_argument("--heads", type=int, default=8)
@@ -80,6 +103,7 @@ def main() -> None:
     v_flash = v_sdpa.permute(0, 2, 1, 3).contiguous()
 
     sdpa_t = bench_sdpa(q_sdpa, k_sdpa, v_sdpa, args.iters, args.warmup)
+    rocm_t = bench_rocm_attn(q_sdpa, k_sdpa, v_sdpa, args.iters, args.warmup)
     flash_t = bench_flash(q_flash, k_flash, v_flash, args.iters, args.warmup)
 
     print("=== Attention Benchmark ===")
@@ -87,6 +111,12 @@ def main() -> None:
     print(f"shape: B={args.batch}, H={args.heads}, L={args.seqlen}, D={args.headdim}")
     print(f"dtype: {args.dtype}")
     print(f"SDPA: {sdpa_t*1000:.3f} ms/iter")
+    if rocm_t is None:
+        print("ROCm attn: unavailable")
+    else:
+        print(f"ROCm attn: {rocm_t*1000:.3f} ms/iter")
+        if rocm_t > 0:
+            print(f"Speedup vs SDPA: {sdpa_t/rocm_t:.2f}x")
     if flash_t is None:
         print("FlashAttention: unavailable")
     else:

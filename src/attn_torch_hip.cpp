@@ -5,13 +5,17 @@
 
 #include "attn_kernel.h"
 
-static torch::Tensor attn_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+namespace py = pybind11;
+
+static torch::Tensor attn_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal) {
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA/HIP tensor");
     TORCH_CHECK(k.is_cuda(), "k must be a CUDA/HIP tensor");
     TORCH_CHECK(v.is_cuda(), "v must be a CUDA/HIP tensor");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
-    TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
-    TORCH_CHECK(v.scalar_type() == torch::kFloat32, "v must be float32");
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
+                "q, k, v must have the same dtype");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16 ||
+                q.scalar_type() == torch::kBFloat16,
+                "q, k, v must be float32, float16, or bfloat16");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D [B, H, S, D]");
 
     auto q_contig = q.contiguous();
@@ -20,19 +24,33 @@ static torch::Tensor attn_forward(torch::Tensor q, torch::Tensor k, torch::Tenso
 
     const int B = static_cast<int>(q_contig.size(0));
     const int H = static_cast<int>(q_contig.size(1));
-    const int S = static_cast<int>(q_contig.size(2));
+    const int Sq = static_cast<int>(q_contig.size(2));
     const int D = static_cast<int>(q_contig.size(3));
+    const int Skv = static_cast<int>(k_contig.size(2));
+
+    TORCH_CHECK(k_contig.size(0) == B && v_contig.size(0) == B, "k/v batch size must match q");
+    TORCH_CHECK(k_contig.size(1) == H && v_contig.size(1) == H, "k/v heads must match q");
+    TORCH_CHECK(k_contig.size(3) == D && v_contig.size(3) == D, "k/v D must match q");
 
     auto out = torch::zeros_like(q_contig);
 
     hipStream_t stream = reinterpret_cast<hipStream_t>(at::hip::getDefaultHIPStreamMasqueradingAsCUDA().stream());
 
+    AttnDType dtype = ATTN_F32;
+    if (q.scalar_type() == torch::kFloat16) {
+        dtype = ATTN_F16;
+    } else if (q.scalar_type() == torch::kBFloat16) {
+        dtype = ATTN_BF16;
+    }
+
     launch_attn_forward(
-        q_contig.data_ptr<float>(),
-        k_contig.data_ptr<float>(),
-        v_contig.data_ptr<float>(),
-        out.data_ptr<float>(),
-        B, H, S, D,
+        q_contig.data_ptr(),
+        k_contig.data_ptr(),
+        v_contig.data_ptr(),
+        out.data_ptr(),
+        B, H, Sq, Skv, D,
+        causal,
+        dtype,
         stream
     );
 
@@ -40,5 +58,6 @@ static torch::Tensor attn_forward(torch::Tensor q, torch::Tensor k, torch::Tenso
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_forward", &attn_forward, "Naive attention forward (ROCm)");
+    m.def("attn_forward", &attn_forward, "Naive attention forward (ROCm)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
 }
