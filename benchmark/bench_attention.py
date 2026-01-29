@@ -62,10 +62,9 @@ def bench_rocm_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, iters: in
     except Exception:
         return None
 
-    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
-        q = q.float().contiguous()
-        k = k.float().contiguous()
-        v = v.float().contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
 
     _ = attn_forward(q, k, v)
     _sync(q.device)
@@ -79,16 +78,80 @@ def bench_rocm_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, iters: in
     return (time.time() - t0) / iters
 
 
+
+
+def check_sdpa_backend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, flash: bool, mem_efficient: bool) -> None:
+    if hasattr(torch.nn.attention, "sdpa_kernel"):
+        backend = (
+            torch.nn.attention.SDPBackend.FLASH_ATTENTION
+            if flash
+            else torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION
+        )
+        ctx = torch.nn.attention.sdpa_kernel(backend)
+    else:
+        ctx = torch.backends.cuda.sdp_kernel(
+            enable_flash=flash,
+            enable_math=False,
+            enable_mem_efficient=mem_efficient,
+        )
+
+def bench_sdpa_backend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    flash: bool,
+    mem_efficient: bool,
+    iters: int,
+    warmup: int,
+) -> float:
+    def make_ctx():
+        if hasattr(torch.nn.attention, "sdpa_kernel"):
+            backend = (
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION
+                if flash
+                else torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION
+            )
+            return torch.nn.attention.sdpa_kernel(backend)
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=flash,
+            enable_math=False,
+            enable_mem_efficient=mem_efficient,
+        )
+
+    with make_ctx():
+        _ = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=False
+        )
+    _sync(q.device)
+    with make_ctx():
+        for _ in range(warmup):
+            _ = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False
+            )
+    _sync(q.device)
+    t0 = time.time()
+    with make_ctx():
+        for _ in range(iters):
+            _ = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False
+            )
+    _sync(q.device)
+    return (time.time() - t0) / iters
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark ROCm attn vs SDPA vs FlashAttention")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seqlen", type=int, default=256)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--headdim", type=int, default=64)
+    parser.add_argument("--headdim", type=int, default=16)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--check-backends", action="store_true", help="Run SDPA backend checks")
     args = parser.parse_args()
 
     dtype = _torch_dtype(args.dtype)
@@ -101,6 +164,28 @@ def main() -> None:
     q_flash = q_sdpa.permute(0, 2, 1, 3).contiguous()
     k_flash = k_sdpa.permute(0, 2, 1, 3).contiguous()
     v_flash = v_sdpa.permute(0, 2, 1, 3).contiguous()
+
+    if args.check_backends:
+        sdpa_flash_t = bench_sdpa_backend(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            flash=True,
+            mem_efficient=False,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+        sdpa_mem_t = bench_sdpa_backend(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            flash=False,
+            mem_efficient=True,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+        print(f"SDPA flash-only: {sdpa_flash_t*1000:.3f} ms/iter")
+        print(f"SDPA mem_efficient-only: {sdpa_mem_t*1000:.3f} ms/iter")
 
     sdpa_t = bench_sdpa(q_sdpa, k_sdpa, v_sdpa, args.iters, args.warmup)
     rocm_t = bench_rocm_attn(q_sdpa, k_sdpa, v_sdpa, args.iters, args.warmup)

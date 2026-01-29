@@ -47,6 +47,7 @@ __global__ void attn_forward_kernel_simple(const T* q, const T* k, const T* v, T
     int b = t / H;
 
     float scale = rsqrtf((float)D);
+    float scale_log2 = scale * 1.4426950408889634f; // log2(e)
 
     float max_score = -INFINITY;
     for (int ks = 0; ks < Skv; ++ks) {
@@ -57,7 +58,7 @@ __global__ void attn_forward_kernel_simple(const T* q, const T* k, const T* v, T
             int k_idx = idx4(b, h, ks, d, H, Skv, D);
             score += AttnTraits<T>::load(q + q_idx) * AttnTraits<T>::load(k + k_idx);
         }
-        score *= scale;
+        score *= scale_log2;
         if (score > max_score) max_score = score;
     }
 
@@ -75,8 +76,8 @@ __global__ void attn_forward_kernel_simple(const T* q, const T* k, const T* v, T
             int k_idx = idx4(b, h, ks, d, H, Skv, D);
             score += AttnTraits<T>::load(q + q_idx) * AttnTraits<T>::load(k + k_idx);
         }
-        score = score * scale - max_score;
-        float w = expf(score);
+        score = score * scale_log2 - max_score;
+        float w = exp2f(score);
         denom += w;
         for (int d = 0; d < D; ++d) {
             int v_idx = idx4(b, h, ks, d, H, Skv, D);
@@ -110,78 +111,104 @@ __global__ void attn_forward_kernel_block(const T* q, const T* k, const T* v, T*
 
     int tid = threadIdx.x;
     int threads = blockDim.x;
+    float scale_log2 = rsqrtf((float)D) * 1.4426950408889634f; // log2(e)
 
+    constexpr int TILE_K = 32;
     extern __shared__ float smem[];
-    float* red = smem;
-    float* scores = red + threads;
-    float* qbuf = scores + Skv;
+    float* red = smem;                        // threads
+    float* qbuf = red + threads;              // D
+    float* kbuf = qbuf + D;                   // TILE_K * D
+    float* vbuf = kbuf + TILE_K * D;          // TILE_K * D
+    float* scores = vbuf + TILE_K * D;        // TILE_K
+    float* meta = scores + TILE_K;            // 3 floats: max, sum, scale
 
     if (tid < D) {
         int q_idx = idx4(b, h, s, tid, H, Sq, D);
         qbuf[tid] = AttnTraits<T>::load(q + q_idx);
     }
+    if (tid == 0) {
+        meta[0] = -INFINITY;
+        meta[1] = 0.0f;
+        meta[2] = 1.0f;
+    }
     __syncthreads();
 
-    float max_score = -INFINITY;
-    for (int ks = 0; ks < Skv; ++ks) {
-        if (causal && ks > s) {
-            if (tid == 0) scores[ks] = -INFINITY;
-            __syncthreads();
-            continue;
+    float acc = 0.0f;
+    for (int ks0 = 0; ks0 < Skv; ks0 += TILE_K) {
+        int tile_len = (ks0 + TILE_K <= Skv) ? TILE_K : (Skv - ks0);
+        int tile_elems = tile_len * D;
+        for (int idx = tid; idx < tile_elems; idx += threads) {
+            int ks = idx / D;
+            int d = idx - ks * D;
+            int k_idx = idx4(b, h, ks0 + ks, d, H, Skv, D);
+            int v_idx = idx4(b, h, ks0 + ks, d, H, Skv, D);
+            kbuf[ks * D + d] = AttnTraits<T>::load(k + k_idx);
+            vbuf[ks * D + d] = AttnTraits<T>::load(v + v_idx);
         }
-        float partial = 0.0f;
-        if (tid < D) {
-            int k_idx = idx4(b, h, ks, tid, H, Skv, D);
-            partial = qbuf[tid] * AttnTraits<T>::load(k + k_idx);
-        }
-        red[tid] = partial;
         __syncthreads();
 
-        for (int stride = threads / 2; stride >= 1; stride >>= 1) {
-            if (tid < stride) {
-                red[tid] += red[tid + stride];
+        for (int ks = 0; ks < tile_len; ++ks) {
+            float partial = 0.0f;
+            if (tid < D) {
+                partial = qbuf[tid] * kbuf[ks * D + tid];
+            }
+            red[tid] = partial;
+            __syncthreads();
+            for (int stride = threads / 2; stride >= 1; stride >>= 1) {
+                if (tid < stride) {
+                    red[tid] += red[tid + stride];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                float score = red[0] * scale_log2;
+                if (causal && (ks0 + ks) > s) score = -INFINITY;
+                scores[ks] = score;
             }
             __syncthreads();
         }
 
         if (tid == 0) {
-            float score = red[0] * rsqrtf((float)D);
-            scores[ks] = score;
-            if (score > max_score) max_score = score;
-            red[0] = max_score;
+            float tile_max = -INFINITY;
+            for (int ks = 0; ks < tile_len; ++ks) {
+                float sc = scores[ks];
+                if (sc > tile_max) tile_max = sc;
+            }
+            float prev_max = meta[0];
+            float new_max = fmaxf(prev_max, tile_max);
+            float scale = (prev_max == -INFINITY) ? 0.0f : exp2f(prev_max - new_max);
+            float tile_sum = 0.0f;
+            for (int ks = 0; ks < tile_len; ++ks) {
+                float sc = scores[ks];
+                if (sc != -INFINITY) tile_sum += exp2f(sc - new_max);
+            }
+            meta[0] = new_max;
+            meta[1] = meta[1] * scale + tile_sum;
+            meta[2] = scale;
         }
         __syncthreads();
-        max_score = red[0];
-    }
 
-    float local_sum = 0.0f;
-    for (int ks = tid; ks < Skv; ks += threads) {
-        float score = scores[ks];
-        local_sum += expf(score - max_score);
-    }
-    red[tid] = local_sum;
-    __syncthreads();
-    for (int stride = threads / 2; stride >= 1; stride >>= 1) {
-        if (tid < stride) {
-            red[tid] += red[tid + stride];
+        if (tid < D) {
+            float scale = meta[2];
+            float new_max = meta[0];
+            acc *= scale;
+            for (int ks = 0; ks < tile_len; ++ks) {
+                float sc = scores[ks];
+                if (sc == -INFINITY) continue;
+                float w = exp2f(sc - new_max);
+                acc += w * vbuf[ks * D + tid];
+            }
         }
         __syncthreads();
     }
-    float denom = red[0];
-    float inv_denom = 1.0f / denom;
 
+    float denom = meta[1];
+    float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     if (tid < D) {
-        float acc = 0.0f;
-        for (int ks = 0; ks < Skv; ++ks) {
-            float w = expf(scores[ks] - max_score) * inv_denom;
-            int v_idx = idx4(b, h, ks, tid, H, Skv, D);
-            acc += w * AttnTraits<T>::load(v + v_idx);
-        }
         int o_idx = idx4(b, h, s, tid, H, Sq, D);
-        out[o_idx] = AttnTraits<T>::store(acc);
+        out[o_idx] = AttnTraits<T>::store(acc * inv_denom);
     }
 }
-
 __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half* q, const __half* k, const __half* v, __half* out,
                                              int B, int H, int Sq, int Skv, int D, int causal) {
     int bh = blockIdx.x;
@@ -343,9 +370,10 @@ __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half
                 // accumulate P*V for this row, each lane handles one d=col
                 float acc = out_sh0[r][col];
                 float local_score = scores_sh[r][col];
+                float w_local = (local_score == -INFINITY) ? 0.0f : exp2f(local_score - new_max);
                 #pragma unroll
                 for (int c = 0; c < 16; ++c) {
-                    float wc = (col == c && local_score != -INFINITY) ? exp2f(local_score - new_max) : 0.0f;
+                    float wc = (col == c) ? w_local : 0.0f;
                     wc = __shfl(wc, c, 16);
                     acc += wc * __half2float(v_sh[c][col]);
                 }
@@ -405,9 +433,10 @@ __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half
 
                 float acc = out_sh1[r][col];
                 float local_score = scores_sh[r][col];
+                float w_local = (local_score == -INFINITY) ? 0.0f : exp2f(local_score - new_max);
                 #pragma unroll
                 for (int c = 0; c < 16; ++c) {
-                    float wc = (col == c && local_score != -INFINITY) ? exp2f(local_score - new_max) : 0.0f;
+                    float wc = (col == c) ? w_local : 0.0f;
                     wc = __shfl(wc, c, 16);
                     acc += wc * __half2float(v_sh[c][col]);
                 }
@@ -446,8 +475,9 @@ extern "C" void launch_attn_forward(const void* q, const void* k, const void* v,
     int threads = 1;
     while (threads < D) threads <<= 1;
     if (threads > 256) threads = 256;
-    size_t smem_bytes = (size_t)(threads + Skv + D) * sizeof(float);
-    bool use_block = (D <= 256) && (smem_bytes <= 48 * 1024);
+    const int tile_k = 32;
+    size_t smem_bytes = (size_t)(threads + D + tile_k * D * 2 + tile_k + 3) * sizeof(float);
+    bool use_block = (D <= 128) && (smem_bytes <= 48 * 1024);
     int blocks_simple = (total + 256 - 1) / 256;
     int causal_flag = causal ? 1 : 0;
 
