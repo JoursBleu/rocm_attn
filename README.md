@@ -55,6 +55,24 @@ PYTHONPATH=./python python benchmark/bench_attention.py \
   --batch 1 --heads 32 --seqlen 2048 --headdim 128 --dtype fp16 --check-backends
 ```
 
+### 5) 环境与结果（参考）
+
+环境：
+- OS: Linux 6.14.0-37-generic (Ubuntu 24.04.1)
+- ROCm: 7.1.0
+- PyTorch: 2.9.1+rocm7.1.0
+- HIP: 7.1.25424-4179531dcd
+- GPU: gfx1201 (Device ID 0x7551), 4x
+- CPU: AMD Ryzen Threadripper PRO 9995WX 96-Cores
+
+结果（$B=1, H=32, L=2048, D=128, fp16$）：
+- SDPA flash-only: 1.859 ms/iter
+- SDPA mem-efficient-only: 1.589 ms/iter
+- SDPA: 1.413 ms/iter
+- ROCm attn: 1.310 ms/iter
+- FlashAttention: 1.615 ms/iter
+
+
 ## 设计目标
 
 - 为 Radeon 提供可落地的高性能注意力实现
