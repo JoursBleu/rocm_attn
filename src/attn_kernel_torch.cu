@@ -227,6 +227,7 @@ __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half
     __shared__ __half v_sh0[16][16];
     __shared__ __half v_sh1[16][16];
     __shared__ float scores_sh[16][16];
+    __shared__ __half p_sh[16][16];
     __shared__ float out_sh0[16][16];
     __shared__ float out_sh1[16][16];
     __shared__ float max_sh[32];
@@ -367,19 +368,24 @@ __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half
                     sum_sh[r] = sum_sh[r] * scale + sum;
                 }
 
-                // accumulate P*V for this row, each lane handles one d=col
-                float acc = out_sh0[r][col];
-                float local_score = scores_sh[r][col];
-                float w_local = (local_score == -INFINITY) ? 0.0f : exp2f(local_score - new_max);
-                #pragma unroll
-                for (int c = 0; c < 16; ++c) {
-                    float wc = (col == c) ? w_local : 0.0f;
-                    wc = __shfl(wc, c, 16);
-                    acc += wc * __half2float(v_sh[c][col]);
-                }
-                out_sh0[r][col] = acc;
             }
         }
+        __syncthreads();
+
+        for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
+            int r = idx / 16;
+            int c = idx % 16;
+            float score = scores_sh[r][c];
+            float w = (score == -INFINITY) ? 0.0f : exp2f(score - max_sh[r]);
+            p_sh[r][c] = __float2half_rn(w);
+        }
+        __syncthreads();
+
+        load_matrix_sync(a0, &p_sh[0][0], 16);
+        load_matrix_sync(bfrag, &v_sh[0][0], 16);
+        load_matrix_sync(acc, &out_sh0[0][0], 16, mem_row_major);
+        mma_sync(acc, a0, bfrag, acc);
+        store_matrix_sync(&out_sh0[0][0], acc, 16, mem_row_major);
         __syncthreads();
 
         fill_fragment(acc, 0.0f);
@@ -431,18 +437,22 @@ __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half
                     sum_sh[row] = sum_sh[row] * scale + sum;
                 }
 
-                float acc = out_sh1[r][col];
-                float local_score = scores_sh[r][col];
-                float w_local = (local_score == -INFINITY) ? 0.0f : exp2f(local_score - new_max);
-                #pragma unroll
-                for (int c = 0; c < 16; ++c) {
-                    float wc = (col == c) ? w_local : 0.0f;
-                    wc = __shfl(wc, c, 16);
-                    acc += wc * __half2float(v_sh[c][col]);
-                }
-                out_sh1[r][col] = acc;
             }
         }
+        for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
+            int r = idx / 16;
+            int c = idx % 16;
+            float score = scores_sh[r][c];
+            float w = (score == -INFINITY) ? 0.0f : exp2f(score - max_sh[16 + r]);
+            p_sh[r][c] = __float2half_rn(w);
+        }
+        __syncthreads();
+
+        load_matrix_sync(a1, &p_sh[0][0], 16);
+        load_matrix_sync(bfrag, &v_sh[0][0], 16);
+        load_matrix_sync(acc, &out_sh1[0][0], 16, mem_row_major);
+        mma_sync(acc, a1, bfrag, acc);
+        store_matrix_sync(&out_sh1[0][0], acc, 16, mem_row_major);
         __syncthreads();
     }
 
