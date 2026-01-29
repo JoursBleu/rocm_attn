@@ -4,19 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-SHAPES_LIST=(
-  "1,32,1024,128"
-  "1,32,2048,128"
-  "1,32,4096,128"
-  "1,64,2048,128"
-  "1,64,4096,128"
-  "1,32,2048,256"
-  "1,32,128,2048,128"
-  "1,32,256,2048,128"
-  "1,32,1024,2048,128"
-  "1,64,1024,2048,128"
-)
-SHAPES="$(IFS=';'; echo "${SHAPES_LIST[*]}")"
+SHAPES_FILE="${SCRIPT_DIR}/attn_shapes_unifolm_infer.txt"
+
+if [[ ! -f "${SHAPES_FILE}" ]]; then
+  echo "Shapes file not found: ${SHAPES_FILE}" >&2
+  exit 1
+fi
+
+SHAPES="$(grep -v '^[[:space:]]*$' "${SHAPES_FILE}" | paste -sd ';' -)"
 
 cd "${REPO_ROOT}"
 
