@@ -46,6 +46,15 @@ ls
 # TODO: 补充使用示例
 ```
 
+### 4) 性能基准（常见配置）
+
+下面示例采用常见 LLM 配置：$B=1, H=32, L=2048, D=128, fp16$。
+
+```
+PYTHONPATH=./python python benchmark/bench_attention.py \
+  --batch 1 --heads 32 --seqlen 2048 --headdim 128 --dtype fp16 --check-backends
+```
+
 ## 设计目标
 
 - 为 Radeon 提供可落地的高性能注意力实现
