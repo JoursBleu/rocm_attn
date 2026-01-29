@@ -1,0 +1,47 @@
+base_model_inference:
+
+x=(2560, 16, 512), context=None, count=2
+x=(16, 2560, 320), context=None, count=5
+x=(16, 2560, 320), context=(1, 93, 1024), count=5
+x=(2560, 16, 320), context=None, count=10
+x=(16, 640, 640), context=None, count=5
+x=(16, 640, 640), context=(1, 93, 1024), count=5
+x=(640, 16, 640), context=None, count=10
+x=(16, 160, 1280), context=None, count=5
+x=(16, 160, 1280), context=(1, 93, 1024), count=5
+x=(160, 16, 1280), context=None, count=10
+x=(16, 40, 1280), context=None, count=1
+x=(16, 40, 1280), context=(1, 93, 1024), count=1
+x=(40, 16, 1280), context=None, count=2
+
+world_model_decision_making:
+
+x=(2560, 16, 512), context=None, count=2
+x=(16, 2560, 320), context=None, count=5
+x=(16, 2560, 320), context=(16, 351, 1024), count=5
+x=(2560, 16, 320), context=None, count=10
+x=(16, 640, 640), context=None, count=5
+x=(16, 640, 640), context=(16, 351, 1024), count=5
+x=(640, 16, 640), context=None, count=10
+x=(16, 160, 1280), context=None, count=5
+x=(16, 160, 1280), context=(16, 351, 1024), count=5
+x=(160, 16, 1280), context=None, count=10
+x=(16, 40, 1280), context=None, count=1
+x=(16, 40, 1280), context=(16, 351, 1024), count=1
+x=(40, 16, 1280), context=None, count=2
+
+world_model_interaction:
+
+x=(2560, 16, 512), context=None, count=2
+x=(16, 2560, 320), context=None, count=5
+x=(16, 2560, 320), context=(16, 351, 1024), count=5
+x=(2560, 16, 320), context=None, count=10
+x=(16, 640, 640), context=None, count=5
+x=(16, 640, 640), context=(16, 351, 1024), count=5
+x=(640, 16, 640), context=None, count=10
+x=(16, 160, 1280), context=None, count=5
+x=(16, 160, 1280), context=(16, 351, 1024), count=5
+x=(160, 16, 1280), context=None, count=10
+x=(16, 40, 1280), context=None, count=1
+x=(16, 40, 1280), context=(16, 351, 1024), count=1
+x=(40, 16, 1280), context=None, count=2
