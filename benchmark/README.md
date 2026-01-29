@@ -13,14 +13,14 @@ benchmark/ ROCm 环境下对比 **SDPA**（PyTorch scaled dot-product attention�
 
 ## 用法
 ```bash
-# 示例（使用 ROCm GPU 3）
-CUDA_VISIBLE_DEVICES=3 python3 benchmark/bench_attention.py   --batch 1   --seqlen 512   --heads 8   --headdim 64   --dtype fp16   --iters 500   --warmup 50   --backend both
+# 示例
+python3 benchmark/bench_attention.py   --batch 1   --seqlen 512   --heads 8   --headdim 64   --dtype fp16   --iters 500   --warmup 50   --backend both
 
 # 仅测 SDPA
-CUDA_VISIBLE_DEVICES=3 python3 benchmark/bench_attention.py   --backend sdpa
+python3 benchmark/bench_attention.py   --backend sdpa
 
 # 仅测 FlashAttention
-CUDA_VISIBLE_DEVICES=3 python3 benchmark/bench_attention.py   --backend flash
+python3 benchmark/bench_attention.py   --backend flash
 ```
 
 ## 备注
