@@ -99,114 +99,258 @@ __global__ void attn_forward_kernel_simple(const T* q, const T* k, const T* v, T
 template <typename T>
 __global__ void attn_forward_kernel_block(const T* q, const T* k, const T* v, T* out,
                                           int B, int H, int Sq, int Skv, int D, int causal) {
-    int query_idx = blockIdx.x;
+    int query_base = blockIdx.x * 2;
     int total = B * H * Sq;
-    if (query_idx >= total) return;
-
-    int t = query_idx;
-    int s = t % Sq;
-    t /= Sq;
-    int h = t % H;
-    int b = t / H;
+    if (query_base >= total) return;
 
     int tid = threadIdx.x;
     int threads = blockDim.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = (threads + 31) >> 5;
     float scale_log2 = rsqrtf((float)D) * 1.4426950408889634f; // log2(e)
 
     constexpr int TILE_K = 32;
     extern __shared__ float smem[];
     float* red = smem;                        // threads
-    float* qbuf = red + threads;              // D
-    float* kbuf = qbuf + D;                   // TILE_K * D
+    float* qbuf = red + threads;              // 2 * D
+    float* kbuf = qbuf + 2 * D;               // TILE_K * D
     float* vbuf = kbuf + TILE_K * D;          // TILE_K * D
-    float* scores = vbuf + TILE_K * D;        // TILE_K
-    float* meta = scores + TILE_K;            // 3 floats: max, sum, scale
+    float* scores = vbuf + TILE_K * D;        // 2 * TILE_K
+    float* meta = scores + 2 * TILE_K;        // 6 floats: max0,sum0,scale0,max1,sum1,scale1
+
+    int qidx0 = query_base;
+    int qidx1 = query_base + 1;
+
+    int t0 = qidx0;
+    int s0 = t0 % Sq;
+    t0 /= Sq;
+    int h0 = t0 % H;
+    int b0 = t0 / H;
+
+    bool valid1 = qidx1 < total;
+    int b1 = b0;
+    int h1 = h0;
+    int s1 = s0;
+    if (valid1) {
+        int t1 = qidx1;
+        s1 = t1 % Sq;
+        t1 /= Sq;
+        h1 = t1 % H;
+        b1 = t1 / H;
+        valid1 = (b1 == b0) && (h1 == h0);
+    }
 
     if (tid < D) {
-        int q_idx = idx4(b, h, s, tid, H, Sq, D);
-        qbuf[tid] = AttnTraits<T>::load(q + q_idx);
+        int q_idx0 = idx4(b0, h0, s0, tid, H, Sq, D);
+        qbuf[tid] = AttnTraits<T>::load(q + q_idx0);
+        if (valid1) {
+            int q_idx1 = idx4(b1, h1, s1, tid, H, Sq, D);
+            qbuf[D + tid] = AttnTraits<T>::load(q + q_idx1);
+        } else {
+            qbuf[D + tid] = 0.0f;
+        }
     }
     if (tid == 0) {
-        meta[0] = -INFINITY;
-        meta[1] = 0.0f;
-        meta[2] = 1.0f;
+        meta[0] = -INFINITY; // max0
+        meta[1] = 0.0f;      // sum0
+        meta[2] = 1.0f;      // scale0
+        meta[3] = -INFINITY; // max1
+        meta[4] = 0.0f;      // sum1
+        meta[5] = 1.0f;      // scale1
     }
     __syncthreads();
 
-    float acc = 0.0f;
+    float acc0_0 = 0.0f;
+    float acc0_1 = 0.0f;
+    float acc1_0 = 0.0f;
+    float acc1_1 = 0.0f;
+
     for (int ks0 = 0; ks0 < Skv; ks0 += TILE_K) {
         int tile_len = (ks0 + TILE_K <= Skv) ? TILE_K : (Skv - ks0);
         int tile_elems = tile_len * D;
-        for (int idx = tid; idx < tile_elems; idx += threads) {
-            int ks = idx / D;
-            int d = idx - ks * D;
-            int k_idx = idx4(b, h, ks0 + ks, d, H, Skv, D);
-            int v_idx = idx4(b, h, ks0 + ks, d, H, Skv, D);
-            kbuf[ks * D + d] = AttnTraits<T>::load(k + k_idx);
-            vbuf[ks * D + d] = AttnTraits<T>::load(v + v_idx);
+        if constexpr (std::is_same<T, __half>::value) {
+            int halfD = (D + 1) >> 1;
+            int tile_elems2 = tile_len * halfD;
+            for (int idx = tid; idx < tile_elems2; idx += threads) {
+                int ks = idx / halfD;
+                int d2 = idx - ks * halfD;
+                int d0 = d2 * 2;
+                int d1 = d0 + 1;
+                int k_idx = idx4(b0, h0, ks0 + ks, d0, H, Skv, D);
+                int v_idx = idx4(b0, h0, ks0 + ks, d0, H, Skv, D);
+                if (d1 < D) {
+                    const __half2 kv = *reinterpret_cast<const __half2*>(k + k_idx);
+                    const __half2 vv = *reinterpret_cast<const __half2*>(v + v_idx);
+                    const float2 kf = __half22float2(kv);
+                    const float2 vf = __half22float2(vv);
+                    kbuf[ks * D + d0] = kf.x;
+                    kbuf[ks * D + d1] = kf.y;
+                    vbuf[ks * D + d0] = vf.x;
+                    vbuf[ks * D + d1] = vf.y;
+                } else {
+                    kbuf[ks * D + d0] = AttnTraits<T>::load(k + k_idx);
+                    vbuf[ks * D + d0] = AttnTraits<T>::load(v + v_idx);
+                }
+            }
+        } else {
+            for (int idx = tid; idx < tile_elems; idx += threads) {
+                int ks = idx / D;
+                int d = idx - ks * D;
+                int k_idx = idx4(b0, h0, ks0 + ks, d, H, Skv, D);
+                int v_idx = idx4(b0, h0, ks0 + ks, d, H, Skv, D);
+                kbuf[ks * D + d] = AttnTraits<T>::load(k + k_idx);
+                vbuf[ks * D + d] = AttnTraits<T>::load(v + v_idx);
+            }
         }
         __syncthreads();
 
         for (int ks = 0; ks < tile_len; ++ks) {
-            float partial = 0.0f;
+            int base = ks * D;
+            float partial0 = 0.0f;
+            float partial1 = 0.0f;
             if (tid < D) {
-                partial = qbuf[tid] * kbuf[ks * D + tid];
-            }
-            red[tid] = partial;
-            __syncthreads();
-            for (int stride = threads / 2; stride >= 1; stride >>= 1) {
-                if (tid < stride) {
-                    red[tid] += red[tid + stride];
+                partial0 = qbuf[tid] * kbuf[base + tid];
+                if (valid1) {
+                    partial1 = qbuf[D + tid] * kbuf[base + tid];
                 }
-                __syncthreads();
             }
+            float sum = partial0;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum += __shfl_down(sum, offset, 32);
+            }
+            if (lane == 0) {
+                red[warp_id] = sum;
+            }
+            __syncthreads();
+            if (warp_id == 0) {
+                float warp_sum = (lane < num_warps) ? red[lane] : 0.0f;
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    warp_sum += __shfl_down(warp_sum, offset, 32);
+                }
+                if (lane == 0) {
+                    red[0] = warp_sum;
+                }
+            }
+            __syncthreads();
             if (tid == 0) {
-                float score = red[0] * scale_log2;
-                if (causal && (ks0 + ks) > s) score = -INFINITY;
-                scores[ks] = score;
+                float score0 = red[0] * scale_log2;
+                if (causal && (ks0 + ks) > s0) score0 = -INFINITY;
+                scores[ks] = score0;
+            }
+            __syncthreads();
+
+            float sum1 = partial1;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum1 += __shfl_down(sum1, offset, 32);
+            }
+            if (lane == 0) {
+                red[warp_id] = sum1;
+            }
+            __syncthreads();
+            if (warp_id == 0) {
+                float warp_sum = (lane < num_warps) ? red[lane] : 0.0f;
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    warp_sum += __shfl_down(warp_sum, offset, 32);
+                }
+                if (lane == 0) {
+                    red[0] = warp_sum;
+                }
+            }
+            __syncthreads();
+            if (tid == 0) {
+                float score1 = red[0] * scale_log2;
+                if (!valid1 || (causal && (ks0 + ks) > s1)) score1 = -INFINITY;
+                scores[TILE_K + ks] = score1;
             }
             __syncthreads();
         }
 
         if (tid == 0) {
-            float tile_max = -INFINITY;
+            float tile_max0 = -INFINITY;
+            float tile_max1 = -INFINITY;
             for (int ks = 0; ks < tile_len; ++ks) {
-                float sc = scores[ks];
-                if (sc > tile_max) tile_max = sc;
+                float sc0 = scores[ks];
+                float sc1 = scores[TILE_K + ks];
+                if (sc0 > tile_max0) tile_max0 = sc0;
+                if (sc1 > tile_max1) tile_max1 = sc1;
             }
-            float prev_max = meta[0];
-            float new_max = fmaxf(prev_max, tile_max);
-            float scale = (prev_max == -INFINITY) ? 0.0f : exp2f(prev_max - new_max);
-            float tile_sum = 0.0f;
+            float prev_max0 = meta[0];
+            float prev_max1 = meta[3];
+            float new_max0 = fmaxf(prev_max0, tile_max0);
+            float new_max1 = fmaxf(prev_max1, tile_max1);
+            float scale0 = (prev_max0 == -INFINITY) ? 0.0f : exp2f(prev_max0 - new_max0);
+            float scale1 = (prev_max1 == -INFINITY) ? 0.0f : exp2f(prev_max1 - new_max1);
+            float tile_sum0 = 0.0f;
+            float tile_sum1 = 0.0f;
             for (int ks = 0; ks < tile_len; ++ks) {
-                float sc = scores[ks];
-                if (sc != -INFINITY) tile_sum += exp2f(sc - new_max);
+                float sc0 = scores[ks];
+                float sc1 = scores[TILE_K + ks];
+                if (sc0 != -INFINITY) tile_sum0 += exp2f(sc0 - new_max0);
+                if (sc1 != -INFINITY) tile_sum1 += exp2f(sc1 - new_max1);
             }
-            meta[0] = new_max;
-            meta[1] = meta[1] * scale + tile_sum;
-            meta[2] = scale;
+            meta[0] = new_max0;
+            meta[1] = meta[1] * scale0 + tile_sum0;
+            meta[2] = scale0;
+            meta[3] = new_max1;
+            meta[4] = meta[4] * scale1 + tile_sum1;
+            meta[5] = scale1;
         }
         __syncthreads();
 
-        if (tid < D) {
-            float scale = meta[2];
-            float new_max = meta[0];
-            acc *= scale;
+        if (tid < (D + 1) / 2) {
+            int d0 = tid * 2;
+            int d1 = d0 + 1;
+            float scale0 = meta[2];
+            float scale1 = meta[5];
+            float new_max0 = meta[0];
+            float new_max1 = meta[3];
+            acc0_0 *= scale0;
+            acc1_0 *= scale0;
+            if (d1 < D) {
+                acc0_1 *= scale0;
+                acc1_1 *= scale0;
+            }
             for (int ks = 0; ks < tile_len; ++ks) {
-                float sc = scores[ks];
-                if (sc == -INFINITY) continue;
-                float w = exp2f(sc - new_max);
-                acc += w * vbuf[ks * D + tid];
+                int base = ks * D;
+                float sc0 = scores[ks];
+                float sc1 = scores[TILE_K + ks];
+                if (sc0 != -INFINITY) {
+                    float w0 = exp2f(sc0 - new_max0);
+                    acc0_0 += w0 * vbuf[base + d0];
+                    if (d1 < D) acc0_1 += w0 * vbuf[base + d1];
+                }
+                if (sc1 != -INFINITY) {
+                    float w1 = exp2f(sc1 - new_max1);
+                    acc1_0 += w1 * vbuf[base + d0];
+                    if (d1 < D) acc1_1 += w1 * vbuf[base + d1];
+                }
             }
         }
         __syncthreads();
     }
 
-    float denom = meta[1];
-    float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-    if (tid < D) {
-        int o_idx = idx4(b, h, s, tid, H, Sq, D);
-        out[o_idx] = AttnTraits<T>::store(acc * inv_denom);
+    float denom0 = meta[1];
+    float denom1 = meta[4];
+    float inv_denom0 = (denom0 > 0.0f) ? (1.0f / denom0) : 0.0f;
+    float inv_denom1 = (denom1 > 0.0f) ? (1.0f / denom1) : 0.0f;
+    if (tid < (D + 1) / 2) {
+        int d0 = tid * 2;
+        int d1 = d0 + 1;
+        int o_idx0 = idx4(b0, h0, s0, d0, H, Sq, D);
+        out[o_idx0] = AttnTraits<T>::store(acc0_0 * inv_denom0);
+        if (d1 < D) {
+            int o_idx1 = idx4(b0, h0, s0, d1, H, Sq, D);
+            out[o_idx1] = AttnTraits<T>::store(acc0_1 * inv_denom0);
+        }
+        if (valid1) {
+            int o_idx2 = idx4(b1, h1, s1, d0, H, Sq, D);
+            out[o_idx2] = AttnTraits<T>::store(acc1_0 * inv_denom1);
+            if (d1 < D) {
+                int o_idx3 = idx4(b1, h1, s1, d1, H, Sq, D);
+                out[o_idx3] = AttnTraits<T>::store(acc1_1 * inv_denom1);
+            }
+        }
     }
 }
 __global__ __launch_bounds__(128) void attn_forward_kernel_wmma_f16(const __half* q, const __half* k, const __half* v, __half* out,
@@ -486,7 +630,7 @@ extern "C" void launch_attn_forward(const void* q, const void* k, const void* v,
     while (threads < D) threads <<= 1;
     if (threads > 256) threads = 256;
     const int tile_k = 32;
-    size_t smem_bytes = (size_t)(threads + D + tile_k * D * 2 + tile_k + 3) * sizeof(float);
+    size_t smem_bytes = (size_t)(threads + D * 2 + tile_k * D * 2 + tile_k * 2 + 6) * sizeof(float);
     bool use_block = (D <= 128) && (smem_bytes <= 48 * 1024);
     int blocks_simple = (total + 256 - 1) / 256;
     int causal_flag = causal ? 1 : 0;
@@ -503,7 +647,7 @@ extern "C" void launch_attn_forward(const void* q, const void* k, const void* v,
     switch (dtype) {
         case ATTN_F16:
             if (use_block) {
-                hipLaunchKernelGGL(attn_forward_kernel_block<__half>, dim3(total), dim3(threads), smem_bytes, stream,
+                hipLaunchKernelGGL(attn_forward_kernel_block<__half>, dim3((total + 1) / 2), dim3(threads), smem_bytes, stream,
                                    static_cast<const __half*>(q), static_cast<const __half*>(k),
                                    static_cast<const __half*>(v), static_cast<__half*>(out),
                                    B, H, Sq, Skv, D, causal_flag);
@@ -516,7 +660,7 @@ extern "C" void launch_attn_forward(const void* q, const void* k, const void* v,
             break;
         case ATTN_BF16:
             if (use_block) {
-                hipLaunchKernelGGL(attn_forward_kernel_block<hip_bfloat16>, dim3(total), dim3(threads), smem_bytes, stream,
+                hipLaunchKernelGGL(attn_forward_kernel_block<hip_bfloat16>, dim3((total + 1) / 2), dim3(threads), smem_bytes, stream,
                                    static_cast<const hip_bfloat16*>(q), static_cast<const hip_bfloat16*>(k),
                                    static_cast<const hip_bfloat16*>(v), static_cast<hip_bfloat16*>(out),
                                    B, H, Sq, Skv, D, causal_flag);
@@ -530,7 +674,7 @@ extern "C" void launch_attn_forward(const void* q, const void* k, const void* v,
         case ATTN_F32:
         default:
             if (use_block) {
-                hipLaunchKernelGGL(attn_forward_kernel_block<float>, dim3(total), dim3(threads), smem_bytes, stream,
+                hipLaunchKernelGGL(attn_forward_kernel_block<float>, dim3((total + 1) / 2), dim3(threads), smem_bytes, stream,
                                    static_cast<const float*>(q), static_cast<const float*>(k),
                                    static_cast<const float*>(v), static_cast<float*>(out),
                                    B, H, Sq, Skv, D, causal_flag);
