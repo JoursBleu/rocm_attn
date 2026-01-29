@@ -66,11 +66,11 @@ PYTHONPATH=./python python benchmark/bench_attention.py \
 - CPU: AMD Ryzen Threadripper PRO 9995WX 96-Cores
 
 结果（$B=1, H=32, L=2048, D=128, fp16$）：
-- SDPA flash-only: 1.874 ms/iter
-- SDPA mem-efficient-only: 1.595 ms/iter
-- SDPA: 1.417 ms/iter
-- ROCm attn: 1.305 ms/iter
-- FlashAttention: 1.625 ms/iter
+- SDPA flash-only: 1.859 ms/iter
+- SDPA mem-efficient-only: 1.589 ms/iter
+- SDPA: 1.413 ms/iter
+- ROCm attn: 1.310 ms/iter
+- FlashAttention: 1.615 ms/iter
 
 
 ## 设计目标
